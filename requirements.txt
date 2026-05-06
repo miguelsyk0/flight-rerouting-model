@@ -1,0 +1,31 @@
+# Flight Path Rerouting — Project Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core data
+requests
+pandas
+numpy
+python-dotenv
+
+# Geospatial
+shapely
+
+# ML & preprocessing
+scikit-learn
+imbalanced-learn
+scipy
+
+# Deep learning (LSTM)
+tensorflow 
+
+# Web App
+streamlit
+
+# Visualization
+matplotlib
+seaborn
+plotly
+
+# Notebook support (optional but recommended)
+jupyter
+ipykernel
