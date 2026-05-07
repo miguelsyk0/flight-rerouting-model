@@ -632,36 +632,74 @@ def finalize_dataset(df: pd.DataFrame):
     """
     log.info("Finalizing dataset...")
 
-    # ── WEATHER-LABEL ALIGNMENT (for synthetic data) ──────────
-    # Since synthetic rerouting was added randomly in 99_generate_synthetic_data,
-    # the model won't learn a correlation between weather and rerouting.
-    # We "re-align" synthetic rows so rerouting is correlated with bad weather.
-    if "icao24" in df.columns:
-        syn_mask = df["icao24"].str.startswith("r", na=False)
-        reroute_mask = (df["rerouted"] == 1) & syn_mask
-        
-        # Inject "storm" features into rerouted synthetic flights probabilistically
-        # This prevents the model from over-relying on a single threshold
-        n_reroute = reroute_mask.sum()
-        df.loc[reroute_mask, "wind_speed_kt"]      += np.random.uniform(20, 60, n_reroute)
-        df.loc[reroute_mask, "visibility_sm"]      *= np.random.uniform(0.1, 0.5, n_reroute)
-        df.loc[reroute_mask, "turb_intensity_num"]  = np.random.randint(3, 7, n_reroute)
-        df.loc[reroute_mask, "convective_flag"]    = (np.random.random(n_reroute) < 0.8).astype(int)
-        df.loc[reroute_mask, "in_sigmet_conv"]     = (np.random.random(n_reroute) < 0.7).astype(int)
-        # precip_flag: correlated with convective but not identical (rain without TS, etc.)
-        df.loc[reroute_mask, "precip_flag"]        = (np.random.random(n_reroute) < 0.85).astype(int)
+    # ── WEATHER-LABEL ALIGNMENT (for synthetic data) ──────────────────────────
+    # Inject weather signal correlated with rerouting, but with deliberate
+    # class overlap and label noise so the RF cannot achieve perfect separation.
+    #
+    # Design goals:
+    #   • Rerouted rows tend to have worse weather — but NOT deterministically.
+    #   • Non-rerouted rows can also have bad weather (convective avoidance not
+    #     always labelled as a deviation if the offset was small).
+    #   • ~8% of labels are randomly flipped to simulate ground-truth noise
+    #     (real ATC data has mislabelled reroutes; this also prevents AUC=1.0).
+    rng_align = np.random.default_rng(42)   # fixed seed for reproducibility
 
-        # Ensure straight synthetic flights have mostly "clear" weather but with some noise
-        clear_mask = (df["rerouted"] == 0) & syn_mask
-        n_clear = clear_mask.sum()
-        # Allow clear flights to have higher winds (up to 60kt) to avoid target leakage
-        df.loc[clear_mask, "wind_speed_kt"]      = df.loc[clear_mask, "wind_speed_kt"].clip(upper=60)
-        df.loc[clear_mask, "convective_flag"]    = (np.random.random(n_clear) < 0.15).astype(int)
-        df.loc[clear_mask, "precip_flag"]        = (np.random.random(n_clear) < 0.20).astype(int)
-        df.loc[clear_mask, "in_sigmet_conv"]     = (np.random.random(n_clear) < 0.10).astype(int)
-        df.loc[clear_mask, "turb_intensity_num"]  = np.random.randint(0, 3, n_clear)
-        
-        log.info(f"Aligned {syn_mask.sum()} synthetic waypoints for realistic training.")
+    if "icao24" in df.columns:
+        syn_mask     = df["icao24"].str.startswith("r", na=False)
+        reroute_mask = (df["rerouted"] == 1) & syn_mask
+        clear_mask   = (df["rerouted"] == 0) & syn_mask
+        n_reroute    = reroute_mask.sum()
+        n_clear      = clear_mask.sum()
+
+        # ── Rerouted rows: inject storm weather, but leave ~25% as ambiguous ──
+        # Wind boost: moderate range with high variance so clear-air
+        # high-wind events can look similar to storm-rerouted events
+        wind_boost = rng_align.uniform(10, 55, n_reroute)   # was 20-60, tighter now
+        df.loc[reroute_mask, "wind_speed_kt"] = (
+            df.loc[reroute_mask, "wind_speed_kt"] + wind_boost
+        ).clip(upper=120)
+        df.loc[reroute_mask, "visibility_sm"] *= rng_align.uniform(0.15, 0.75, n_reroute)
+        # Turbulence: wide range so moderate-turb reroutes exist
+        df.loc[reroute_mask, "turb_intensity_num"] = rng_align.integers(2, 7, n_reroute)
+        # Convective: only ~65% of rerouted rows (was 80%) — structural icing, TURB, etc.
+        df.loc[reroute_mask, "convective_flag"] = (
+            rng_align.random(n_reroute) < 0.65
+        ).astype(int)
+        df.loc[reroute_mask, "in_sigmet_conv"] = (
+            rng_align.random(n_reroute) < 0.55
+        ).astype(int)
+        df.loc[reroute_mask, "precip_flag"] = (
+            rng_align.random(n_reroute) < 0.75
+        ).astype(int)
+
+        # ── Non-rerouted rows: mostly clear but with realistic bad-weather noise ─
+        df.loc[clear_mask, "wind_speed_kt"] = (
+            df.loc[clear_mask, "wind_speed_kt"].clip(upper=80)   # allow stronger clear-air winds
+        )
+        # ~20% of clear flights can have moderate convective (flew through it, didn't deviate)
+        df.loc[clear_mask, "convective_flag"] = (
+            rng_align.random(n_clear) < 0.20
+        ).astype(int)
+        df.loc[clear_mask, "precip_flag"] = (
+            rng_align.random(n_clear) < 0.28
+        ).astype(int)
+        df.loc[clear_mask, "in_sigmet_conv"] = (
+            rng_align.random(n_clear) < 0.15
+        ).astype(int)
+        # Allow turb 0-4 so moderate turbulence exists in non-rerouted flights too
+        df.loc[clear_mask, "turb_intensity_num"] = rng_align.integers(0, 5, n_clear)
+
+        # ── Label noise: flip ~8% of synthetic labels ─────────────────────────
+        # Simulates: undetected reroutes, minor offsets labelled inconsistently,
+        # ATC-initiated deviations not reflected in deviation_nm, etc.
+        syn_indices  = df.index[syn_mask].tolist()
+        n_flip       = max(1, int(0.08 * len(syn_indices)))
+        flip_indices = rng_align.choice(syn_indices, size=n_flip, replace=False)
+        df.loc[flip_indices, "rerouted"] = 1 - df.loc[flip_indices, "rerouted"]
+        log.info(
+            f"Aligned {syn_mask.sum()} synthetic waypoints with class overlap "
+            f"and {n_flip} label flips ({100*n_flip/max(1,syn_mask.sum()):.1f}% noise)."
+        )
 
     # Keep metadata separately
     meta = df[[c for c in META_COLS if c in df.columns]].copy()
